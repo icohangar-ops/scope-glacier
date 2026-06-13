@@ -13,6 +13,8 @@ from datetime import datetime, timedelta
 import boto3
 import requests
 
+from cubiczan_resilience import resilient
+
 logger = logging.getLogger(__name__)
 
 EIA_BASE = "https://api.eia.gov/v2"
@@ -50,6 +52,26 @@ ENERGY_SERIES = {
 }
 
 
+@resilient(timeout=30, max_attempts=3)
+def _fetch_series(series, params, api_key):
+    """Fetch a single EIA series with timeout, retry/backoff and circuit breaker.
+
+    Transient EIA/network failures are retried with exponential backoff + jitter
+    before surfacing to the per-commodity error handler in fetch_eia_data.
+    """
+    r = requests.get(
+        f"{EIA_BASE}/series/{series}",
+        params=params,
+        # Pass the API key via the X-Api-Key header (supported by the EIA v2
+        # API) rather than a URL query parameter. Query params leak into
+        # CloudWatch logs, EIA access logs, and any HTTP proxy logs.
+        headers={"X-Api-Key": api_key},
+        timeout=30,
+    )
+    r.raise_for_status()
+    return r.json()
+
+
 def fetch_eia_data(event):
     """Fetch EIA spot prices and write to S3.
 
@@ -75,17 +97,11 @@ def fetch_eia_data(event):
             continue
 
         try:
-            # Pass the API key via the X-Api-Key header (supported by the EIA v2
-            # API) rather than a URL query parameter. Query params leak into
-            # CloudWatch logs, EIA access logs, and any HTTP proxy logs.
-            r = requests.get(
-                f"{EIA_BASE}/series/{config['series']}",
-                params={"start": start, "end": end, "frequency": "daily"},
-                headers={"X-Api-Key": api_key},
-                timeout=30,
+            data = _fetch_series(
+                config["series"],
+                {"start": start, "end": end, "frequency": "daily"},
+                api_key,
             )
-            r.raise_for_status()
-            data = r.json()
 
             for element in data.get("response", {}).get("data", []):
                 records.append({

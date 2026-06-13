@@ -486,9 +486,32 @@ resource "aws_iam_role_policy" "lambda" {
           aws_ssm_parameter.eia_api_key.arn,
           aws_ssm_parameter.fred_api_key.arn,
         ]
+      },
+      {
+        Effect = "Allow"
+        Action = ["sqs:SendMessage"]
+        Resource = [
+          aws_sqs_queue.eia_ingestion_dlq.arn,
+          aws_sqs_queue.glacier_analysis_dlq.arn,
+        ]
       }
     ]
   })
+}
+
+# ============================================================
+# Dead Letter Queues — capture failed (e.g. async EventBridge)
+# Lambda invocations so they are not silently dropped.
+# ============================================================
+
+resource "aws_sqs_queue" "eia_ingestion_dlq" {
+  name                      = "${var.project_name}-eia-ingestion-dlq"
+  message_retention_seconds = 1209600 # 14 days
+}
+
+resource "aws_sqs_queue" "glacier_analysis_dlq" {
+  name                      = "${var.project_name}-analysis-dlq"
+  message_retention_seconds = 1209600 # 14 days
 }
 
 # ============================================================
@@ -522,6 +545,10 @@ resource "aws_lambda_function" "eia_ingestion" {
   timeout       = 300
   memory_size   = 512
 
+  dead_letter_config {
+    target_arn = aws_sqs_queue.eia_ingestion_dlq.arn
+  }
+
   environment {
     variables = {
       RAW_BUCKET             = aws_s3_bucket.raw.id
@@ -541,6 +568,10 @@ resource "aws_lambda_function" "glacier_analysis" {
   runtime       = "python3.12"
   timeout       = 300
   memory_size   = 1024
+
+  dead_letter_config {
+    target_arn = aws_sqs_queue.glacier_analysis_dlq.arn
+  }
 
   environment {
     variables = {
@@ -651,7 +682,18 @@ resource "aws_sfn_state_machine" "glacier_pipeline" {
           "days"          = 30
         }
         ResultPath = "$.ingestion"
-        Next       = "ComputeScores"
+        Retry = [{
+          ErrorEquals     = ["States.ALL"]
+          IntervalSeconds = 2
+          MaxAttempts     = 3
+          BackoffRate     = 2.0
+        }]
+        Catch = [{
+          ErrorEquals = ["States.ALL"]
+          ResultPath  = "$.error"
+          Next        = "PipelineFailed"
+        }]
+        Next = "ComputeScores"
       }
       "ComputeScores" = {
         Type     = "Task"
@@ -663,7 +705,18 @@ resource "aws_sfn_state_machine" "glacier_pipeline" {
           "inventory_days"   = 28.0
         }
         ResultPath = "$.scores"
-        Next       = "BedrockAnalysis"
+        Retry = [{
+          ErrorEquals     = ["States.ALL"]
+          IntervalSeconds = 2
+          MaxAttempts     = 3
+          BackoffRate     = 2.0
+        }]
+        Catch = [{
+          ErrorEquals = ["States.ALL"]
+          ResultPath  = "$.error"
+          Next        = "PipelineFailed"
+        }]
+        Next = "BedrockAnalysis"
       }
       "BedrockAnalysis" = {
         Type     = "Task"
@@ -673,7 +726,18 @@ resource "aws_sfn_state_machine" "glacier_pipeline" {
           "signals.$" = "$.scores.body"
         }
         ResultPath = "$.analysis"
-        Next       = "WriteSignals"
+        Retry = [{
+          ErrorEquals     = ["States.ALL"]
+          IntervalSeconds = 2
+          MaxAttempts     = 3
+          BackoffRate     = 2.0
+        }]
+        Catch = [{
+          ErrorEquals = ["States.ALL"]
+          ResultPath  = "$.error"
+          Next        = "PipelineFailed"
+        }]
+        Next = "WriteSignals"
       }
       "WriteSignals" = {
         Type     = "Task"
@@ -682,7 +746,25 @@ resource "aws_sfn_state_machine" "glacier_pipeline" {
           "step"     = "write_signals"
           "signals.$" = "$.analysis.body"
         }
+        Retry = [{
+          ErrorEquals     = ["States.ALL"]
+          IntervalSeconds = 2
+          MaxAttempts     = 3
+          BackoffRate     = 2.0
+        }]
+        Catch = [{
+          ErrorEquals = ["States.ALL"]
+          ResultPath  = "$.error"
+          Next        = "PipelineFailed"
+        }]
         End = true
+      }
+      # Terminal failure state — surfaces the error details captured by the
+      # Catch blocks above so a failed run is explicit rather than silent.
+      "PipelineFailed" = {
+        Type  = "Fail"
+        Error = "GlacierPipelineError"
+        Cause = "A pipeline task failed after exhausting retries; see $.error."
       }
     }
   })

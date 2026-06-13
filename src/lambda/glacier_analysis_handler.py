@@ -11,11 +11,17 @@ Orchestrated by Step Functions state machine:
 import json
 import logging
 import os
+import time
 from datetime import datetime
 
 import boto3
 
+from cubiczan_resilience import resilient
+
 logger = logging.getLogger(__name__)
+
+# Terminal Athena query states.
+_ATHENA_TERMINAL = {"SUCCEEDED", "FAILED", "CANCELLED"}
 
 SCORE_WEIGHTS = {"supply_demand": 0.30, "price_momentum": 0.25, "geopolitical": 0.25, "seasonal": 0.20}
 
@@ -46,6 +52,51 @@ def _validate_numeric(value, name, lo, hi):
     if not (lo <= num <= hi):
         raise ValueError(f"{name} out of range [{lo}, {hi}]: {num}")
     return num
+
+
+def _wait_for_athena(athena, query_execution_id, max_wait=120.0, poll_interval=1.0):
+    """Poll GetQueryExecution until the query reaches a terminal state.
+
+    Raises RuntimeError if the query FAILED or was CANCELLED, or TimeoutError if
+    it does not finish within max_wait seconds. Without this poll, a query that
+    Athena rejects after start_query_execution returns would silently produce no
+    rows and the pipeline would treat it as success.
+    """
+    deadline = time.time() + max_wait
+    while True:
+        resp = athena.get_query_execution(QueryExecutionId=query_execution_id)
+        status = resp["QueryExecution"]["Status"]
+        state = status["State"]
+        if state in _ATHENA_TERMINAL:
+            if state != "SUCCEEDED":
+                reason = status.get("StateChangeReason", "no reason given")
+                raise RuntimeError(
+                    f"Athena query {query_execution_id} {state}: {reason}"
+                )
+            return state
+        if time.time() >= deadline:
+            raise TimeoutError(
+                f"Athena query {query_execution_id} did not finish within {max_wait}s"
+            )
+        time.sleep(poll_interval)
+
+
+@resilient(timeout=150, max_attempts=3)
+def _run_athena_query(athena, query, database, output_location):
+    """Start an Athena query and block until it succeeds.
+
+    Wrapped with @resilient so transient StartQueryExecution / GetQueryExecution
+    throttling is retried with exponential backoff + jitter and tripped by the
+    circuit breaker after repeated failures.
+    """
+    response = athena.start_query_execution(
+        QueryString=query,
+        QueryExecutionContext={"Database": database},
+        ResultConfiguration={"OutputLocation": output_location},
+    )
+    query_execution_id = response["QueryExecutionId"]
+    _wait_for_athena(athena, query_execution_id)
+    return query_execution_id
 
 
 def compute_glacier_scores(event):
@@ -104,10 +155,8 @@ def compute_glacier_scores(event):
                 ROUND(COALESCE((SELECT daily_std FROM vol), 0) * (252.0 ** 0.5) * 100, 2) AS annualized_volatility_pct
             """
 
-            response = athena.start_query_execution(
-                QueryString=query,
-                QueryExecutionContext={"Database": database},
-                ResultConfiguration={"OutputLocation": f"{s3_output}glacier/scores/"},
+            query_execution_id = _run_athena_query(
+                athena, query, database, f"{s3_output}glacier/scores/"
             )
 
             # Compute component scores
@@ -143,7 +192,7 @@ def compute_glacier_scores(event):
 
             signals.append({
                 "commodity_code": code,
-                "query_id": response["QueryExecutionId"],
+                "query_id": query_execution_id,
                 "glacier_score": glacier_score,
                 "signal_rating": rating,
                 "supply_demand_score": sd_score,
@@ -158,8 +207,14 @@ def compute_glacier_scores(event):
     return signals
 
 
+@resilient(timeout=60, max_attempts=3)
 def invoke_bedrock_analysis(commodity_code: str, signal_data: dict) -> str:
-    """Invoke Bedrock Converse API for energy market AI analysis."""
+    """Invoke Bedrock Converse API for energy market AI analysis.
+
+    Wrapped with @resilient so transient Bedrock throttling/timeouts are retried
+    with exponential backoff + jitter; the existing try/except still degrades
+    gracefully to an "Analysis unavailable" string once retries are exhausted.
+    """
     bedrock = boto3.client("bedrock-runtime", region_name=os.environ.get("AWS_REGION", "us-east-1"))
     model_id = os.environ.get("BEDROCK_MODEL_ID", "anthropic.claude-3-haiku-20240307-v1:0")
 
@@ -237,10 +292,8 @@ def write_signals_to_iceberg(signals: list):
                 '{data_sources}'
             )
             """
-            athena.start_query_execution(
-                QueryString=query,
-                QueryExecutionContext={"Database": database},
-                ResultConfiguration={"OutputLocation": f"{s3_output}signals/write/"},
+            _run_athena_query(
+                athena, query, database, f"{s3_output}signals/write/"
             )
         except Exception as e:
             logger.error(f"Error writing signal for {signal.get('commodity_code', '?')}: {e}")
