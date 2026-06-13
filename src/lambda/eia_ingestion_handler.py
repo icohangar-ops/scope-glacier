@@ -3,6 +3,10 @@ EIA Data Ingestion Lambda Handler — Fetches EIA energy data and writes to S3.
 
 Triggered by EventBridge schedule or Step Functions.
 Uses EIA Open Data API for spot prices and petroleum supply/demand data.
+
+The generic "fetch external records -> write JSON Lines to S3 -> envelope" flow
+lives in scope_core.BaseIngestionHandler / write_jsonl_to_s3; this module keeps
+only the EIA-specific fetch logic and S3 partitioning.
 """
 
 import json
@@ -14,6 +18,12 @@ import boto3
 import requests
 
 from cubiczan_resilience import resilient
+from scope_core import (
+    BaseIngestionHandler,
+    error_response,
+    success_response,
+    write_jsonl_to_s3,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -57,7 +67,7 @@ def _fetch_series(series, params, api_key):
     """Fetch a single EIA series with timeout, retry/backoff and circuit breaker.
 
     Transient EIA/network failures are retried with exponential backoff + jitter
-    before surfacing to the per-commodity error handler in fetch_eia_data.
+    before surfacing to the per-commodity error handler in EIAIngestionHandler.
     """
     r = requests.get(
         f"{EIA_BASE}/series/{series}",
@@ -72,6 +82,50 @@ def _fetch_series(series, params, api_key):
     return r.json()
 
 
+class EIAIngestionHandler(BaseIngestionHandler):
+    """EIA-specific ingestion: fetch spot prices, write JSON Lines to S3.
+
+    The S3 write and JSON-Lines serialization are inherited from
+    scope_core.BaseIngestionHandler; only fetch_records and the partitioned
+    S3 key are domain-specific.
+    """
+
+    def fetch_records(self, event):
+        commodities = event.get("commodities", list(ENERGY_SERIES.keys()))
+        days = event.get("days", 30)
+
+        api_key = _get_eia_api_key()
+        end = datetime.now().strftime("%Y-%m-%d")
+        start = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
+
+        records = []
+        for code, config in ENERGY_SERIES.items():
+            if code not in commodities:
+                continue
+            try:
+                data = _fetch_series(
+                    config["series"],
+                    {"start": start, "end": end, "frequency": "daily"},
+                    api_key,
+                )
+                for element in data.get("response", {}).get("data", []):
+                    records.append({
+                        "commodity_code": code,
+                        "commodity_name": config["name"],
+                        "price_date": element.get("period", ""),
+                        "price_value": float(element.get("value", 0)),
+                        "source": "EIA",
+                        "ingested_at": datetime.utcnow().isoformat(),
+                    })
+                logger.info(f"Fetched {len(data.get('response', {}).get('data', []))} prices for {code}")
+            except Exception as e:
+                logger.error(f"EIA fetch failed for {code}: {e}")
+        return records
+
+    def build_s3_key(self, event):
+        return f"eia/prices/{datetime.now().strftime('%Y/%m/%d')}/spot_prices.jsonl"
+
+
 def fetch_eia_data(event):
     """Fetch EIA spot prices and write to S3.
 
@@ -82,53 +136,23 @@ def fetch_eia_data(event):
     }
     """
     commodities = event.get("commodities", list(ENERGY_SERIES.keys()))
-    days = event.get("days", 30)
-
-    api_key = _get_eia_api_key()
     s3 = boto3.client("s3")
     bucket = os.environ.get("RAW_BUCKET", "scope-glacier-raw")
 
-    end = datetime.now().strftime("%Y-%m-%d")
-    start = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
+    handler_obj = EIAIngestionHandler(s3, bucket=bucket)
+    records = handler_obj.fetch_records(event)
 
-    records = []
-    for code, config in ENERGY_SERIES.items():
-        if code not in commodities:
-            continue
-
-        try:
-            data = _fetch_series(
-                config["series"],
-                {"start": start, "end": end, "frequency": "daily"},
-                api_key,
-            )
-
-            for element in data.get("response", {}).get("data", []):
-                records.append({
-                    "commodity_code": code,
-                    "commodity_name": config["name"],
-                    "price_date": element.get("period", ""),
-                    "price_value": float(element.get("value", 0)),
-                    "source": "EIA",
-                    "ingested_at": datetime.utcnow().isoformat(),
-                })
-            logger.info(f"Fetched {len(data.get('response', {}).get('data', []))} prices for {code}")
-
-        except Exception as e:
-            logger.error(f"EIA fetch failed for {code}: {e}")
-
-    # Write to S3 as JSON Lines
+    s3_path = ""
     if records:
-        key = f"eia/prices/{datetime.now().strftime('%Y/%m/%d')}/spot_prices.jsonl"
-        body = "\n".join(json.dumps(r) for r in records)
-        s3.put_object(Bucket=bucket, Key=key, Body=body)
-        logger.info(f"Wrote {len(records)} records to s3://{bucket}/{key}")
+        key = handler_obj.build_s3_key(event)
+        s3_path = write_jsonl_to_s3(s3, bucket=bucket, key=key, records=records)
+        logger.info(f"Wrote {len(records)} records to {s3_path}")
 
     return {
         "status": "completed",
         "commodities": commodities,
         "records_fetched": len(records),
-        "s3_path": f"s3://{bucket}/{key}" if records else "",
+        "s3_path": s3_path,
         "timestamp": datetime.utcnow().isoformat(),
     }
 
@@ -138,8 +162,7 @@ def handler(event, context):
     logger.info(f"EIA ingestion triggered: {json.dumps(event)[:500]}")
 
     try:
-        result = fetch_eia_data(event)
-        return {"statusCode": 200, "body": json.dumps(result)}
+        return success_response(fetch_eia_data(event))
     except Exception as e:
         logger.error(f"Lambda execution failed: {e}")
-        return {"statusCode": 500, "body": json.dumps({"error": str(e)})}
+        return error_response(e)

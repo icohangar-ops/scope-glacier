@@ -11,17 +11,19 @@ Orchestrated by Step Functions state machine:
 import json
 import logging
 import os
-import time
 from datetime import datetime
 
 import boto3
 
 from cubiczan_resilience import resilient
+from scope_core import (
+    SafeAthenaClient,
+    error_response,
+    success_response,
+    validate_in_allowlist,
+)
 
 logger = logging.getLogger(__name__)
-
-# Terminal Athena query states.
-_ATHENA_TERMINAL = {"SUCCEEDED", "FAILED", "CANCELLED"}
 
 SCORE_WEIGHTS = {"supply_demand": 0.30, "price_momentum": 0.25, "geopolitical": 0.25, "seasonal": 0.20}
 
@@ -35,10 +37,12 @@ ALLOWED_RATINGS = {"Strong Buy", "Buy", "Hold", "Sell", "Strong Sell"}
 
 
 def _validate_commodity_code(code):
-    """Return the code if it is in the allowlist, else raise ValueError."""
-    if code not in ALLOWED_COMMODITY_CODES:
-        raise ValueError(f"Disallowed commodity_code: {code!r}")
-    return code
+    """Return the code if it is in the allowlist, else raise.
+
+    Thin wrapper over scope_core.validate_in_allowlist — the canonical
+    SQL-injection guard shared across the scope-* repos.
+    """
+    return validate_in_allowlist(code, ALLOWED_COMMODITY_CODES, field="commodity_code")
 
 
 def _validate_numeric(value, name, lo, hi):
@@ -54,49 +58,28 @@ def _validate_numeric(value, name, lo, hi):
     return num
 
 
-def _wait_for_athena(athena, query_execution_id, max_wait=120.0, poll_interval=1.0):
-    """Poll GetQueryExecution until the query reaches a terminal state.
-
-    Raises RuntimeError if the query FAILED or was CANCELLED, or TimeoutError if
-    it does not finish within max_wait seconds. Without this poll, a query that
-    Athena rejects after start_query_execution returns would silently produce no
-    rows and the pipeline would treat it as success.
-    """
-    deadline = time.time() + max_wait
-    while True:
-        resp = athena.get_query_execution(QueryExecutionId=query_execution_id)
-        status = resp["QueryExecution"]["Status"]
-        state = status["State"]
-        if state in _ATHENA_TERMINAL:
-            if state != "SUCCEEDED":
-                reason = status.get("StateChangeReason", "no reason given")
-                raise RuntimeError(
-                    f"Athena query {query_execution_id} {state}: {reason}"
-                )
-            return state
-        if time.time() >= deadline:
-            raise TimeoutError(
-                f"Athena query {query_execution_id} did not finish within {max_wait}s"
-            )
-        time.sleep(poll_interval)
-
-
 @resilient(timeout=150, max_attempts=3)
-def _run_athena_query(athena, query, database, output_location):
-    """Start an Athena query and block until it succeeds.
+def _run_athena_query(client, query, output_location):
+    """Start an Athena query via SafeAthenaClient and block until it succeeds.
 
-    Wrapped with @resilient so transient StartQueryExecution / GetQueryExecution
+    The query start + terminal-state poll (including FAILED/CANCELLED detection
+    and the timeout) come from scope_core.SafeAthenaClient. This wrapper keeps
+    the @resilient decorator so transient StartQueryExecution / GetQueryExecution
     throttling is retried with exponential backoff + jitter and tripped by the
     circuit breaker after repeated failures.
     """
-    response = athena.start_query_execution(
-        QueryString=query,
-        QueryExecutionContext={"Database": database},
-        ResultConfiguration={"OutputLocation": output_location},
-    )
-    query_execution_id = response["QueryExecutionId"]
-    _wait_for_athena(athena, query_execution_id)
+    query_execution_id = client.start(query, output_location=output_location)
+    client.wait(query_execution_id)
     return query_execution_id
+
+
+def _make_athena_client():
+    """Build a SafeAthenaClient from the repo's Glue database / output config."""
+    return SafeAthenaClient(
+        boto3.client("athena"),
+        database=os.environ.get("GLUE_DATABASE", "scope_glacier"),
+        output_location=os.environ.get("ATHENA_OUTPUT", "s3://scope-glacier-queries/"),
+    )
 
 
 def compute_glacier_scores(event):
@@ -113,9 +96,8 @@ def compute_glacier_scores(event):
     utilization_pct = _validate_numeric(event.get("utilization_pct", 92.0), "utilization_pct", 0.0, 100.0)
     inventory_days = _validate_numeric(event.get("inventory_days", 28.0), "inventory_days", 0.0, 365.0)
 
-    athena = boto3.client("athena")
-    database = os.environ.get("GLUE_DATABASE", "scope_glacier")
-    s3_output = os.environ.get("ATHENA_OUTPUT", "s3://scope-glacier-queries/")
+    client = _make_athena_client()
+    s3_output = client.output_location
 
     signals = []
     for code in commodity_codes:
@@ -156,7 +138,7 @@ def compute_glacier_scores(event):
             """
 
             query_execution_id = _run_athena_query(
-                athena, query, database, f"{s3_output}glacier/scores/"
+                client, query, f"{s3_output}glacier/scores/"
             )
 
             # Compute component scores
@@ -247,9 +229,9 @@ Provide 2-3 paragraphs covering supply/demand outlook, geopolitical risks, seaso
 
 def write_signals_to_iceberg(signals: list):
     """Write Glacier signals to Iceberg table via Athena."""
-    athena = boto3.client("athena")
-    database = os.environ.get("GLUE_DATABASE", "scope_glacier")
-    s3_output = os.environ.get("ATHENA_OUTPUT", "s3://scope-glacier-queries/")
+    client = _make_athena_client()
+    database = client.database
+    s3_output = client.output_location
 
     for signal in signals:
         if signal.get("status") != "analyzed":
@@ -293,7 +275,7 @@ def write_signals_to_iceberg(signals: list):
             )
             """
             _run_athena_query(
-                athena, query, database, f"{s3_output}signals/write/"
+                client, query, f"{s3_output}signals/write/"
             )
         except Exception as e:
             logger.error(f"Error writing signal for {signal.get('commodity_code', '?')}: {e}")
@@ -315,7 +297,7 @@ def handler(event, context):
 
     if step == "compute_scores":
         signals = compute_glacier_scores(event)
-        return {"statusCode": 200, "body": json.dumps({"step": step, "signals": signals})}
+        return success_response({"step": step, "signals": signals})
 
     elif step == "bedrock_analysis":
         signals = event.get("signals", [])
@@ -324,10 +306,10 @@ def handler(event, context):
             analysis = invoke_bedrock_analysis(code, signal)
             signal["ai_analysis"] = analysis
             signal["status"] = "analyzed"
-        return {"statusCode": 200, "body": json.dumps({"step": step, "signals": signals})}
+        return success_response({"step": step, "signals": signals})
 
     elif step == "write_signals":
         write_signals_to_iceberg(event.get("signals", []))
-        return {"statusCode": 200, "body": json.dumps({"step": step, "status": "completed"})}
+        return success_response({"step": step, "status": "completed"})
 
-    return {"statusCode": 400, "body": json.dumps({"error": f"Unknown step: {step}"})}
+    return error_response(f"Unknown step: {step}", status_code=400)
