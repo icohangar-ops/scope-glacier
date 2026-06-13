@@ -19,6 +19,34 @@ logger = logging.getLogger(__name__)
 
 SCORE_WEIGHTS = {"supply_demand": 0.30, "price_momentum": 0.25, "geopolitical": 0.25, "seasonal": 0.20}
 
+# Allowlist of commodity codes that may be interpolated into Athena SQL.
+# Any code outside this set is rejected before query construction to prevent
+# SQL injection via a caller-controlled Step Functions event.
+ALLOWED_COMMODITY_CODES = {"WTI", "BRENT", "HH", "RBOB", "HO"}
+
+# Valid signal ratings allowed to be written to the Iceberg table.
+ALLOWED_RATINGS = {"Strong Buy", "Buy", "Hold", "Sell", "Strong Sell"}
+
+
+def _validate_commodity_code(code):
+    """Return the code if it is in the allowlist, else raise ValueError."""
+    if code not in ALLOWED_COMMODITY_CODES:
+        raise ValueError(f"Disallowed commodity_code: {code!r}")
+    return code
+
+
+def _validate_numeric(value, name, lo, hi):
+    """Coerce value to float and ensure it falls within [lo, hi]."""
+    try:
+        num = float(value)
+    except (TypeError, ValueError):
+        raise ValueError(f"{name} is not numeric: {value!r}")
+    if num != num or num in (float("inf"), float("-inf")):
+        raise ValueError(f"{name} is not finite: {value!r}")
+    if not (lo <= num <= hi):
+        raise ValueError(f"{name} out of range [{lo}, {hi}]: {num}")
+    return num
+
 
 def compute_glacier_scores(event):
     """Compute composite Glacier scores for specified energy commodities.
@@ -31,8 +59,8 @@ def compute_glacier_scores(event):
     }
     """
     commodity_codes = event.get("commodity_codes", ["WTI", "BRENT", "HH"])
-    utilization_pct = event.get("utilization_pct", 92.0)
-    inventory_days = event.get("inventory_days", 28.0)
+    utilization_pct = _validate_numeric(event.get("utilization_pct", 92.0), "utilization_pct", 0.0, 100.0)
+    inventory_days = _validate_numeric(event.get("inventory_days", 28.0), "inventory_days", 0.0, 365.0)
 
     athena = boto3.client("athena")
     database = os.environ.get("GLUE_DATABASE", "scope_glacier")
@@ -41,6 +69,8 @@ def compute_glacier_scores(event):
     signals = []
     for code in commodity_codes:
         try:
+            # Reject any code not in the allowlist before it reaches the SQL string.
+            code = _validate_commodity_code(code)
             query = f"""
             WITH latest_price AS (
                 SELECT price_value, price_date FROM scope_glacier.price_series
@@ -170,10 +200,25 @@ def write_signals_to_iceberg(signals: list):
         if signal.get("status") != "analyzed":
             continue
         try:
-            code = signal["commodity_code"]
+            # Validate every value that gets interpolated into the SQL string.
+            code = _validate_commodity_code(signal["commodity_code"])
+            rating = signal.get("signal_rating", "Hold")
+            if rating not in ALLOWED_RATINGS:
+                raise ValueError(f"Disallowed signal_rating: {rating!r}")
+            sd_score = _validate_numeric(signal.get("supply_demand_score", 50), "supply_demand_score", -1000, 1000)
+            pm_score = _validate_numeric(signal.get("price_momentum_score", 50), "price_momentum_score", -1000, 1000)
+            geo_score = _validate_numeric(signal.get("geopolitical_score", 50), "geopolitical_score", -1000, 1000)
+            seas_score = _validate_numeric(signal.get("seasonal_score", 50), "seasonal_score", -1000, 1000)
+            g_score = _validate_numeric(signal.get("glacier_score", 50), "glacier_score", -1000, 1000)
+            conf_score = _validate_numeric(signal.get("confidence_score", 0.5), "confidence_score", 0.0, 1.0)
+
             ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+            # signal_id is derived from the allowlisted code, so it is safe.
             signal_id = f"{code}_{ts}"
+            # Free-text fields are escaped for single quotes; their values are not
+            # caller-trusted identifiers so escaping (not allowlisting) is appropriate.
             analysis = signal.get("ai_analysis", "")[:4000].replace("'", "''")
+            data_sources = json.dumps(signal.get("data_sources", [])).replace("'", "''")
 
             query = f"""
             INSERT INTO {database}.glacier_signals
@@ -181,15 +226,15 @@ def write_signals_to_iceberg(signals: list):
                 '{signal_id}',
                 '{code}',
                 TIMESTAMP '{datetime.utcnow().isoformat()}',
-                {signal.get('supply_demand_score', 50)},
-                {signal.get('price_momentum_score', 50)},
-                {signal.get('geopolitical_score', 50)},
-                {signal.get('seasonal_score', 50)},
-                {signal.get('glacier_score', 50)},
-                '{signal.get('signal_rating', 'Hold')}',
+                {sd_score},
+                {pm_score},
+                {geo_score},
+                {seas_score},
+                {g_score},
+                '{rating}',
                 '{analysis}',
-                {signal.get('confidence_score', 0.5)},
-                '{json.dumps(signal.get('data_sources', [])).replace("'", "''")}'
+                {conf_score},
+                '{data_sources}'
             )
             """
             athena.start_query_execution(
@@ -198,7 +243,7 @@ def write_signals_to_iceberg(signals: list):
                 ResultConfiguration={"OutputLocation": f"{s3_output}signals/write/"},
             )
         except Exception as e:
-            logger.error(f"Error writing signal for {code}: {e}")
+            logger.error(f"Error writing signal for {signal.get('commodity_code', '?')}: {e}")
 
 
 def handler(event, context):

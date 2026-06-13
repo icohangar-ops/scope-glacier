@@ -17,6 +17,30 @@ logger = logging.getLogger(__name__)
 
 EIA_BASE = "https://api.eia.gov/v2"
 
+# Cache the resolved API key across warm invocations of the same container.
+_EIA_API_KEY_CACHE = None
+
+
+def _get_eia_api_key():
+    """Resolve the EIA API key, preferring SSM SecureString over env vars.
+
+    The key is fetched from SSM Parameter Store at cold start (path supplied via
+    EIA_API_KEY_PARAM) so it never lives in a plaintext Lambda env var. Falls back
+    to the EIA_API_KEY env var only if no parameter path is configured.
+    """
+    global _EIA_API_KEY_CACHE
+    if _EIA_API_KEY_CACHE is not None:
+        return _EIA_API_KEY_CACHE
+
+    param_name = os.environ.get("EIA_API_KEY_PARAM", "")
+    if param_name:
+        ssm = boto3.client("ssm")
+        resp = ssm.get_parameter(Name=param_name, WithDecryption=True)
+        _EIA_API_KEY_CACHE = resp["Parameter"]["Value"]
+    else:
+        _EIA_API_KEY_CACHE = os.environ.get("EIA_API_KEY", "")
+    return _EIA_API_KEY_CACHE
+
 ENERGY_SERIES = {
     "WTI": {"series": "PET.RWTC.D", "name": "West Texas Intermediate"},
     "BRENT": {"series": "PET.RBRTE.D", "name": "Brent Crude"},
@@ -38,7 +62,7 @@ def fetch_eia_data(event):
     commodities = event.get("commodities", list(ENERGY_SERIES.keys()))
     days = event.get("days", 30)
 
-    api_key = os.environ.get("EIA_API_KEY", "")
+    api_key = _get_eia_api_key()
     s3 = boto3.client("s3")
     bucket = os.environ.get("RAW_BUCKET", "scope-glacier-raw")
 
@@ -51,9 +75,13 @@ def fetch_eia_data(event):
             continue
 
         try:
+            # Pass the API key via the X-Api-Key header (supported by the EIA v2
+            # API) rather than a URL query parameter. Query params leak into
+            # CloudWatch logs, EIA access logs, and any HTTP proxy logs.
             r = requests.get(
                 f"{EIA_BASE}/series/{config['series']}",
-                params={"api_key": api_key, "start": start, "end": end, "frequency": "daily"},
+                params={"start": start, "end": end, "frequency": "daily"},
+                headers={"X-Api-Key": api_key},
                 timeout=30,
             )
             r.raise_for_status()

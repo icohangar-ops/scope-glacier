@@ -478,9 +478,36 @@ resource "aws_iam_role_policy" "lambda" {
           "logs:CreateLogGroup", "logs:CreateLogStream", "logs:PutLogEvents",
         ]
         Resource = "*"
+      },
+      {
+        Effect = "Allow"
+        Action = ["ssm:GetParameter"]
+        Resource = [
+          aws_ssm_parameter.eia_api_key.arn,
+          aws_ssm_parameter.fred_api_key.arn,
+        ]
       }
     ]
   })
+}
+
+# ============================================================
+# Secrets (SSM SecureString) — keep API keys out of plaintext
+# Lambda environment variables. The Lambda reads these at cold start.
+# ============================================================
+
+resource "aws_ssm_parameter" "eia_api_key" {
+  name        = "/${var.project_name}/eia_api_key"
+  description = "US EIA Open Data API key"
+  type        = "SecureString"
+  value       = var.eia_api_key
+}
+
+resource "aws_ssm_parameter" "fred_api_key" {
+  name        = "/${var.project_name}/fred_api_key"
+  description = "FRED API key"
+  type        = "SecureString"
+  value       = var.fred_api_key
 }
 
 # ============================================================
@@ -497,12 +524,12 @@ resource "aws_lambda_function" "eia_ingestion" {
 
   environment {
     variables = {
-      RAW_BUCKET    = aws_s3_bucket.raw.id
-      GLUE_DATABASE = var.glue_database
-      EIA_API_KEY   = var.eia_api_key
-      FRED_API_KEY  = var.fred_api_key
-      AWS_REGION    = var.aws_region
-      ATHENA_OUTPUT = "s3://${aws_s3_bucket.athena_output.bucket}/"
+      RAW_BUCKET             = aws_s3_bucket.raw.id
+      GLUE_DATABASE          = var.glue_database
+      EIA_API_KEY_PARAM      = aws_ssm_parameter.eia_api_key.name
+      FRED_API_KEY_PARAM     = aws_ssm_parameter.fred_api_key.name
+      AWS_REGION             = var.aws_region
+      ATHENA_OUTPUT          = "s3://${aws_s3_bucket.athena_output.bucket}/"
     }
   }
 }
