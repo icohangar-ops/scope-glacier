@@ -37,6 +37,16 @@ htmlcov/
 *.pem
 *.key
 
+# Terraform
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfvars
+crash.log
+
+# Logs
+*.log
+
 # Notebooks
 .ipynb_checkpoints/
 
