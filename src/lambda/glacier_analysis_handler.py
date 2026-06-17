@@ -167,9 +167,11 @@ def compute_glacier_scores(event):
                 rating = "Strong Buy"
             elif glacier_score >= 65:
                 rating = "Buy"
-            elif glacier_score < 35:
+            elif glacier_score >= 35:
+                rating = "Hold"
+            elif glacier_score >= 20:
                 rating = "Sell"
-            elif glacier_score < 20:
+            else:
                 rating = "Strong Sell"
 
             signals.append({
